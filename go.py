@@ -4,14 +4,36 @@ from bs4 import BeautifulSoup
 from bs4 import SoupStrainer
 import getpass
 import os.path
+import os
 import pickle
 import codecs
 import sys
 import time
+import re
+import subprocess
+import shutil
 
 # Basic Config
 canvasUrl = 'https://usflearn.instructure.com/'
 cookieJar = 'cookies.txt'
+
+WORKING_DIR = os.path.abspath(os.path.join(os.getcwd(),'workingdir'))
+
+regSwfXml = r"(\<\?xml.+)((?<!\\)\;|$)"
+
+FFDEC_DIR = 'ffdec_10.0.0'
+
+if os.name == 'nt': # Windows
+  FFDEC_RUN = os.path.join(FFDEC_DIR, 'ffdec.bat')
+else:
+  FFDEC_RUN = os.path.join(FFDEC_DIR, 'ffdec.sh')
+
+FFDEC_RUN = os.path.abspath(FFDEC_RUN);
+
+try:
+  os.mkdir(WORKING_DIR)
+except OSError:
+  pass
 
 # Functions
 
@@ -109,11 +131,13 @@ def downloadPresentation(s):
   # Jackpot is /story_content/frame.xml > yank all the <slidetranscript> elements
   frameUrl = workingUrl + '/story_content/frame.xml'
   frame = s.get(frameUrl, allow_redirects=False)
+  src_prefix = '/story_content'
   
   # Sometimes frame.xml is hiding in presentation_content
   if not frame.ok:
     frameUrl = workingUrl + '/presentation_content/frame.xml'
     frame = s.get(frameUrl, allow_redirects=False)
+    src_prefix = '/presentation_content'
 
   if not frame.ok:
     print('FAILURE: Could not get frame.xml, OH NO!')
@@ -135,11 +159,13 @@ def downloadPresentation(s):
     print('-->')
     print(frame.url)
     return False
-  
-  
     
   # Parse the page
   bsFrame = newBS(frame.content)
+
+  # Find all slides we link 
+  # <slidelink slideid="4pForxcLIQM.6LvdiZk9aLv" displaytext="Definitions of Intelligence" expand="false" type="slide"/>
+  slideIds = [sl['slideid'] for sl in bsFrame.select('nav_data > outline > links > slidelink')]
 
   # transcripts is a list of transcripts 
   #transcripts = BeautifulSoup(frame.content, parse_only=SoupStrainer('slidetranscript')).contents
@@ -148,13 +174,52 @@ def downloadPresentation(s):
   # lines will store the final output
   lines = ''
   for transcript in transcripts:
+    clearWorkingDir()
 
     #transcripts contain inner html that BS hasn't rendered
     inner = newBS(transcript.text).get_text()
-    lines = lines + inner + "\r\n\r\n"
-    
-  #print(lines.encode('utf-8'))  
-  #print(' ')
+    lines = lines + inner
+
+    if transcript['slideid'] not in slideIds:
+      # Ok we have a transcript that's not a direct page. 
+      # This means it's some page's sub-content.
+      # The only way I know of to get this content is to 
+      # extract it out of the linked .swf
+      # Here we go.
+      endId = transcript['slideid'].split('.')[-1]
+      url = workingUrl + src_prefix + ('/slides/%s.swf' % endId)
+      print ('%s is sub-content, trying to get swf for transcript @ %s' % (endId, url))
+
+      swf = download_file(s, url, 'tmp.swf', WORKING_DIR)
+
+      swfText = ''
+      try:
+        subprocess.check_call([FFDEC_RUN, '-export', 'script', WORKING_DIR, os.path.join(WORKING_DIR, 'tmp.swf')])
+
+        for theFile in os.listdir(os.path.join(WORKING_DIR, 'scripts')):
+          with open(os.path.join(WORKING_DIR, 'scripts', theFile), 'r') as f:
+            matches = re.search(regSwfXml, f.read())
+
+          if matches and len(matches.groups()) == 2:
+            xml = matches.group(1)
+            bs = newBS(xml)
+            # Get all the alttext elements
+            altels = bs.find_all(alttext=True)
+            for tt in altels:
+              swfText += tt['alttext'] + os.linesep;
+
+      except subprocess.CalledProcessError:
+        print ('ERROR processing %s' % endId);
+        swfText = None
+      except OSError:
+        print ('No swf for %s' % endId);
+
+      clearWorkingDir()
+
+      if swfText:
+        lines += os.linesep + swfText
+
+    lines += os.linesep*2
   
   filename = time.strftime("%Y%m%d-%H%M%S") + '.txt'
   try:
@@ -186,8 +251,17 @@ def fix_filename(s):
 
 
 # http://stackoverflow.com/questions/16694907/how-to-download-large-file-in-python-with-requests-py
-def download_file(url):
-    local_filename = url.split('/')[-1]
+def download_file(s, url, local_filename=None, path=None):
+    if local_filename is None:
+      local_filename = url.split('/')[-1]
+
+    local_filename = fix_filename(local_filename);
+    
+    if path is None:
+      path = os.getcwd()
+
+    local_filename = os.path.abspath(os.path.join(path, local_filename));
+      
     # NOTE the stream=True parameter
     r = s.get(url, stream=True)
     with open(local_filename, 'wb') as f:
@@ -196,6 +270,23 @@ def download_file(url):
                 f.write(chunk)
                 f.flush()
     return local_filename
+
+
+def clearWorkingDir():
+  try:
+    os.mkdir(WORKING_DIR)
+  except OSError:
+    pass
+
+  for the_file in os.listdir(WORKING_DIR):
+    file_path = os.path.join(WORKING_DIR, the_file)
+    try:
+      if os.path.isfile(file_path):
+        os.unlink(file_path)
+      elif os.path.isdir(file_path): 
+        shutil.rmtree(file_path)
+    except Exception as e:
+      pass
 
 # Converst the horrible MS Word quotes to standard
 # http://nodnod.net/2009/feb/22/converting-quotes-macvim-and-python/
@@ -221,7 +312,6 @@ if __name__ == "__main__":
 
   # Main Loop
   while True:
-    
     while not downloadPresentation(session):
       print('It appears you\'re not logged in')
       doLogin(session)
